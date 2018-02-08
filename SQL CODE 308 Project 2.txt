@@ -1,0 +1,303 @@
+### NOTE - this code is in TextEdit because I couldn't figure out how to save the SQL Query Tool code onto my computer. Thus I just copied and pasted this code into the editor to run it.
+
+
+-- EXPLORE DATA
+SELECT * FROM pos.deptinfo LIMIT 10;
+SELECT * FROM pos.skstinfo LIMIT 10;
+SELECT * FROM pos.skuinfo LIMIT 10;
+SELECT * FROM pos.strinfo LIMIT 10;
+SELECT * FROM pos.trnsact LIMIT 100;
+SELECT * FROM pos.trnsact WHERE c8 = '1' LIMIT 10;
+SELECT COUNT(*) FROM pos.trnsact; -- 20,916,896 rows -- took 19 MINUTES!!!!!
+
+SELECT COUNT(DISTINCT store) FROM pos.strinfo; --453 stores
+SELECT COUNT(DISTINCT store) FROM pos.skstinfo; -- only 357 stores in the table with SKUs
+
+SELECT COUNT(DISTINCT sku) FROM pos.skuinfo; --1,048,576 distinct SKUs
+SELECT DISTINCT(store), COUNT(sku) FROM pos.skstinfo GROUP BY store; -- in excel
+SELECT COUNT(DISTINCT sku) FROM pos.skstinfo; -- only 760,212 distinct SKUs
+
+
+
+
+
+--Create table with SKUS/STORES + profit
+CREATE TABLE rmh027_schema.skus_prof AS
+	SELECT sku, store, cost, retail
+    FROM pos.skstinfo;
+SELECT * FROM rmh027_schema.skus_prof LIMIT 10;    
+ALTER TABLE rmh027_schema.skus_prof ADD profit real;
+UPDATE rmh027_schema.skus_prof SET profit = retail - cost;
+
+--create table with SKUS that are in >= 80% of stores (from skst table NOT store table)
+CREATE TABLE rmh027_schema.good_skus AS
+	SELECT sku, COUNT(DISTINCT(store)) 
+    FROM rmh027_schema.skus_prof 
+    GROUP BY sku
+    HAVING COUNT(DISTINCT store) > 285;
+SELECT * FROM rmh027_schema.good_skus LIMIT 100;
+
+--join good skus and profit table
+CREATE TABLE rmh027_schema.use AS
+	SELECT good_skus.sku AS sku, skus_prof.store AS store, skus_prof.cost AS cost, 
+    skus_prof.retail AS retail, skus_prof.profit AS profit, good_skus.count AS num_stores
+    FROM rmh027_schema.good_skus
+    LEFT JOIN rmh027_schema.skus_prof
+    ON good_skus.sku = skus_prof.sku;
+
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.use; --30,403 distinct SKUs in at least 80% of stores
+SELECT COUNT(DISTINCT(store)) FROM rmh027_schema.use; - 355 stores
+
+
+--find profits for each SKU - average instances where SKUs cost different amounts in different stores
+CREATE TABLE rmh027_schema.use_without_stores AS 
+	SELECT good_skus.sku AS sku, AVG(skus_prof.cost) AS cost, 
+    AVG(skus_prof.retail) AS retail, AVG(skus_prof.profit) AS profit, good_skus.count AS num_stores
+    FROM rmh027_schema.good_skus
+    LEFT JOIN rmh027_schema.skus_prof
+    ON good_skus.sku = skus_prof.sku
+    GROUP BY good_skus.sku, good_skus.count;
+SELECT * FROM rmh027_schema.use_without_stores LIMIT 100;
+SELECT * FROM rmh027_schema.use WHERE sku = 8974;
+
+SELECT AVG(profit) from rmh027_schema.use_without_stores; --16.758 is average profit 
+SELECT COUNT(*) from rmh027_schema.use_without_stores WHERE profit > 16.758 --9917
+
+--this table doesn't average the cost/retails and instead shows multiple rows when there are multiple options - didn't actually use this table 
+CREATE TABLE rmh027_schema.use_condensed AS
+	SELECT good_skus.sku AS sku, skus_prof.cost AS cost, 
+    skus_prof.retail AS retail, skus_prof.profit AS profit, good_skus.count AS num_stores
+    FROM rmh027_schema.good_skus
+    LEFT JOIN rmh027_schema.skus_prof
+    ON good_skus.sku = skus_prof.sku
+    GROUP BY good_skus.sku, skus_prof.cost, skus_prof.retail, skus_prof.profit, good_skus.count;
+SELECT * FROM rmh027_schema.use_condensed LIMIT 1000;
+
+--this table pulls relevant data from transaction table -> everything from the "use" table (with "good" skus and stores) and links it with register/trannum/quantity/sale_date
+CREATE TABLE rmh027_schema.everything AS
+	SELECT use.*, pos.trnsact.c3 AS register, pos.trnsact.c4 AS trannum, pos.trnsact.c8 AS quantity, pos.trnsact.c6 AS sale_date
+    FROM pos.trnsact
+    LEFT JOIN rmh027_schema.use
+    ON use.sku = CAST(trnsact.c1 AS INT) AND use.store = CAST(trnsact.c2 AS INT)
+	WHERE pos.trnsact.c7 = 'P';
+
+SELECT COUNT(*) FROM rmh027_schema.use; -- 9,785,235 rows
+ 
+--this gets rid of null values (SKUS that got eliminated bc they weren't sold in at least 80% of stores
+CREATE TABLE rmh027_schema.everything2 AS
+	SELECT *
+    FROM rmh027_schema.everything
+    WHERE everything.store IS NOT NULL AND everything.sku IS NOT NULL AND everything.profit IS NOT NULL;
+SELECT * FROM rmh027_schema.everything2 LIMIT 100;
+
+--these are the NEW counts of SKUs and STORES —> proof that all tables contain different data. 
+--only 22k out of 30k skus were actually PURCHASED during our time
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.everything2; -- 22,234 SKUS
+SELECT COUNT(DISTINCT(store)) FROM rmh027_schema.everything2; -- 325 stores
+
+--same sku, store, register, trannum, sale_date -- SUM QUANTITIES
+CREATE TABLE rmh027_schema.everything_summed AS
+	SELECT sku, store, register, trannum, sale_date, SUM(CAST(quantity AS INT)) AS quantity
+    FROM rmh027_schema.everything2
+    GROUP BY sku, store, register, trannum, sale_date;
+SELECT * FROM rmh027_schema.everything_summed WHERE quantity > 1 LIMIT 100;
+SELECT COUNT(*) FROM rmh027_schema.everything_summed; -- 25 million rows
+
+CREATE TABLE rmh027_schema.skus_transacts2 AS
+	SELECT sku, COUNT(*)
+    FROM rmh027_schema.everything_summed
+    GROUP BY sku;
+    
+SELECT * FROM rmh027_schema.skus_transacts2 LIMIT 100;
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts2 WHERE count > 1000; -- 5,251
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts2 WHERE count > 5000; -- 754.. 342 over 10,000
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts2 WHERE count > 100000; -- 7
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts2 WHERE count <= 1000; -- 16,983
+SELECT SUM(count) FROM rmh027_schema.skus_transacts2;
+
+CREATE TABLE rmh027_schema.skus_profits AS
+	SELECT skus_transacts2.sku, skus_transacts2.count, use_without_stores.cost, use_without_stores.retail,
+    use_without_stores.profit
+    FROM rmh027_schema.skus_transacts2
+    LEFT JOIN rmh027_schema.use_without_stores
+    ON skus_transacts2.sku = use_without_stores.sku
+    ORDER BY profit DESC;
+CREATE TABLE rmh027_schema.skus_topprofits AS
+	SELECT *
+    FROM rmh027_schema.skus_profits
+    LIMIT 11117;
+
+SELECT * FROM rmh027_schema.skus_topprofits LIMIT 100;
+SELECT AVG(profit) FROM rmh027_schema.skus_profits; -- 14.172
+SELECT COUNT(*) FROM rmh027_schema.skus_profits WHERE profit >= 14.172; -- 6720 SKUs 
+
+SELECT MIN(profit) FROM rmh027_schema.skus_topprofits; -- AVG = 25.05, MIN = 9.00
+SELECT COUNT(*) FROM rmh027_schema.skus_topprofits WHERE count >= 1000; -- 1,883 > 1000.... 186 > 5,000... 83 > 10,000
+
+--use top profits to make everything_summed SMALLER so it can be queued and transactions can be counted
+CREATE TABLE rmh027_schema.everything_summed_topprofits AS
+	SELECT skus_topprofits.sku, everything_summed.store, everything_summed.register, everything_summed.trannum,
+    everything_summed.sale_date, everything_summed.quantity
+    FROM rmh027_schema.skus_topprofits
+    LEFT JOIN rmh027_schema.everything_summed
+    ON skus_topprofits.sku = everything_summed.sku; --8.46 million rows
+
+CREATE TABLE rmh027_schema.num_transactions AS
+	SELECT store, register, trannum, sale_date, count(sku)
+	FROM rmh027_schema.everything_summed_topprofits
+	GROUP BY store, register, trannum, sale_date; ---7,142,819
+    
+SELECT COUNT(*) FROM num_transactions WHERE count > 1; -- 1,031,233 transactions
+
+--CREATE TABLE num_transactions_check AS
+--	SELECT store, trannum, sale_date, count(sku)
+--	FROM rmh027_schema.everything_summed_topprofits
+--	GROUP BY store, trannum, sale_date; ---4,328,356 -- can verify that all FOUR are needed for unique trans
+
+SELECT * FROM num_transactions LIMIT 1000;
+
+
+
+--NOW pull out only transactions with more than one item bought in transaction
+CREATE TABLE rmh027_schema.multi AS
+	SELECT store, trannum, register, sale_date, count
+    FROM num_transactions
+    WHERE count > 1;
+
+--NOW re-add SKUs to only these transactions
+CREATE TABLE rmh027_schema.multi_skus AS
+	SELECT everything_summed_topprofits.sku, multi.store, multi.trannum, multi.sale_date, multi.register
+    FROM rmh027_schema.multi
+    LEFT JOIN rmh027_schema.everything_summed_topprofits 
+    ON everything_summed_topprofits.store = multi.store AND everything_summed_topprofits.trannum = 
+    multi.trannum AND everything_summed_topprofits.sale_date = multi.sale_date AND everything_summed_topprofits.register
+    = multi.register;
+-- 2,353,113!!!! yay way cut down
+SELECT * FROM rmh027_schema.multi_skus LIMIT 1000;
+
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.multi_skus; -- 10,504 (down from 11,117)
+
+--try minsup = 1000
+CREATE TABLE rmh027_schema.minsup1000 AS
+	SELECT skus_topprofits.sku, multi_skus.store, multi_skus.register, multi_skus.trannum,
+    multi_skus.sale_date, skus_topprofits.count
+	FROM rmh027_schema.skus_topprofits
+    INNER JOIN rmh027_schema.multi_skus
+    ON skus_topprofits.sku = multi_skus.sku
+    WHERE skus_topprofits.count >= 1000; --1,464,908
+
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.minsup1000; --1886  
+
+--make another of the table to cross join
+CREATE TABLE rmh027_schema.minsup1000_2 AS 
+	SELECT * 
+    FROM rmh027_schema.minsup1000;
+    
+--cross join table to check all baskets of TWO items
+CREATE TABLE rmh027_schema.skus_transacts_twoitems AS
+	SELECT DISTINCT(minsup1000.sku) AS sku1, minsup1000_2.sku AS sku2, COUNT(*)
+    FROM rmh027_schema.minsup1000
+    CROSS JOIN rmh027_schema.minsup1000_2
+    WHERE minsup1000.store = minsup1000_2.store AND minsup1000.trannum = minsup1000_2.trannum AND
+    minsup1000.sale_date = minsup1000_2.sale_date AND minsup1000.register = minsup1000_2.register 
+    AND minsup1000.sku != minsup1000_2.sku
+    GROUP BY minsup1000.sku, minsup1000_2.sku;
+
+SELECT * FROM rmh027_schema.skus_transacts_twoitems LIMIT 1000;
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts_twoitems WHERE count >= 1000; -- only 128 pairs -- halve this for 64 pairs TOO SMALL
+SELECT * FROM rmh027_schema.skus_transacts_twoitems WHERE count >= 1000;
+SELECT COUNT(DISTINCT(sku2)) FROM rmh027_schema.skus_transacts_twoitems WHERE count >= 1000; --52
+
+
+
+
+--TRY minsup = 800
+CREATE TABLE rmh027_schema.minsup800 AS
+	SELECT skus_topprofits.sku, multi_skus.store, multi_skus.register, multi_skus.trannum,
+    multi_skus.sale_date, skus_topprofits.count
+	FROM rmh027_schema.skus_topprofits
+    INNER JOIN rmh027_schema.multi_skus
+    ON skus_topprofits.sku = multi_skus.sku
+    WHERE skus_topprofits.count >= 800; --1,678,691
+
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.minsup800; --2592 
+
+--make another of the table to cross join
+CREATE TABLE rmh027_schema.minsup800_2 AS 
+	SELECT * 
+    FROM rmh027_schema.minsup800;
+    
+--cross join table to check all baskets of TWO items
+CREATE TABLE rmh027_schema.skus_transacts_twoitems_2 AS
+	SELECT DISTINCT(minsup800.sku) AS sku1, minsup800_2.sku AS sku2, COUNT(*)
+    FROM rmh027_schema.minsup800
+    CROSS JOIN rmh027_schema.minsup800_2
+    WHERE minsup800.store = minsup800_2.store AND minsup800.trannum = minsup800_2.trannum AND
+    minsup800.sale_date = minsup800_2.sale_date AND minsup800.register = minsup800_2.register 
+    AND minsup800.sku != minsup800_2.sku
+    GROUP BY minsup800.sku, minsup800_2.sku; - 188416
+
+SELECT * FROM rmh027_schema.skus_transacts_twoitems LIMIT 1000;
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts_twoitems_2 WHERE count >= 800; -- only 176 pairs -- halve this for 88 pairs TOO SMALL
+SELECT * FROM rmh027_schema.skus_transacts_twoitems_2 WHERE count >= 800;
+SELECT COUNT(DISTINCT(sku1)) 
+FROM rmh027_schema.skus_transacts_twoitems_2 
+WHERE count >= 800; -- 71 skus 
+
+
+
+--UGHHHHH TRY minsup = 500
+CREATE TABLE rmh027_schema.minsup500 AS
+	SELECT skus_topprofits.sku, multi_skus.store, multi_skus.register, multi_skus.trannum,
+    multi_skus.sale_date, skus_topprofits.count
+	FROM rmh027_schema.skus_topprofits
+    INNER JOIN rmh027_schema.multi_skus
+    ON skus_topprofits.sku = multi_skus.sku
+    WHERE skus_topprofits.count >= 500; --2,032,511
+
+SELECT COUNT(DISTINCT(sku)) FROM rmh027_schema.minsup500; --4166
+
+--make another of the table to cross join
+CREATE TABLE rmh027_schema.minsup500_2 AS 
+	SELECT * 
+    FROM rmh027_schema.minsup500;
+    
+--cross join table to check all baskets of TWO items
+CREATE TABLE rmh027_schema.skus_transacts_twoitems_3 AS
+	SELECT DISTINCT(minsup500.sku) AS sku1, minsup500_2.sku AS sku2, COUNT(*)
+    FROM rmh027_schema.minsup500
+    CROSS JOIN rmh027_schema.minsup500_2
+    WHERE minsup500.store = minsup500_2.store AND minsup500.trannum = minsup500_2.trannum AND
+    minsup500.sale_date = minsup500_2.sale_date AND minsup500.register = minsup500_2.register 
+    AND minsup500.sku != minsup500_2.sku
+    GROUP BY minsup500.sku, minsup500_2.sku; -- 336,218
+
+SELECT COUNT(*) FROM rmh027_schema.skus_transacts_twoitems_3 WHERE count >= 500; -- 426 pairs -- halve this for 214 pairs
+SELECT * FROM rmh027_schema.skus_transacts_twoitems WHERE count >= 500;
+SELECT COUNT(DISTINCT(sku1)) 
+FROM rmh027_schema.skus_transacts_twoitems_3 
+WHERE count >= 500; -- 177 skus
+
+CREATE TABLE rmh027_schema.conf_and_lift_500 AS
+	SELECT sku1 AS sku1, sku2 AS sku2, count AS count_both, count_sku1
+    FROM rmh027_schema.skus_transacts_twoitems 
+    WHERE count >= 500;
+SELECT * FROM rmh027_schema.conf_and_lift_500;
+
+CREATE TABLE rmh027_schema.conf_and_lift_500_2 AS
+	SELECT conf_and_lift_500.sku1, conf_and_lift_500.sku2, conf_and_lift_500.count_both, 
+    skus_transacts2.count AS count_sku1
+    FROM rmh027_schema.conf_and_lift_500
+    LEFT JOIN rmh027_schema.skus_transacts2
+    ON conf_and_lift_500.sku1 = skus_transacts2.sku;
+
+CREATE TABLE rmh027_schema.conf_and_lift_500_final AS
+	SELECT conf_and_lift_500_2.sku1, conf_and_lift_500_2.sku2, conf_and_lift_500_2.count_both, 
+    conf_and_lift_500_2.count_sku1, skus_transacts2.count AS count_sku2
+    FROM rmh027_schema.conf_and_lift_500_2
+    LEFT JOIN rmh027_schema.skus_transacts2
+    ON conf_and_lift_500_2.sku2 = skus_transacts2.sku;
+
+SELECT * FROM rmh027_schema.conf_and_lift_500_final;
+
+
